@@ -1,4 +1,4 @@
-# AF3 Prep — AlphaFold3 JSON Builder (PTMs • Mutations • Homomeric Copies)
+# AF3 Prep — AlphaFold3 JSON Builder (Sequence Searching • PTMs • Mutations)
 
 Turn a simple table into **AlphaFold3 input JSON** files. The tool:
 
