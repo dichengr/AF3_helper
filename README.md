@@ -52,7 +52,7 @@ Numbered columns per chain:
 
 ---
 
-## 3) PTM syntax (column `ptms` / `ptmsN`)
+## 2) PTM syntax (column `ptms` / `ptmsN`)
 
 Separate multiple tokens with `;`, `,`, or spaces.
 
@@ -80,7 +80,7 @@ Separate multiple tokens with `;`, `,`, or spaces.
 
 ---
 
-## 4) Mutation syntax (column `muts` / `mutsN`)
+## 3) Mutation syntax (column `muts` / `mutsN`)
 
 Separate multiple tokens with `;`, `,`, or spaces. **1-based positions** (UniProt numbering).
 
@@ -104,7 +104,7 @@ Separate multiple tokens with `;`, `,`, or spaces. **1-based positions** (UniPro
 
 ---
 
-## 5) Homomeric copies & chain IDs
+## 4) Homomeric copies & chain IDs
 
 * Set `copies` (or `copiesN`) per chain; default `1`.
 * IDs are auto-assigned **across the complex/row** as **A, B, …, Z, AA, AB, …**.
@@ -119,7 +119,7 @@ Separate multiple tokens with `;`, `,`, or spaces. **1-based positions** (UniPro
 
 ---
 
-## 6) Naming & filenames
+## 5) Naming & filenames
 
 **PTM naming (complex-level rule):**
 
@@ -138,7 +138,7 @@ Separate multiple tokens with `;`, `,`, or spaces. **1-based positions** (UniPro
 
 ---
 
-## 7) How to run
+## 6) How to run
 
 **Long format (recommended)**
 
@@ -164,7 +164,7 @@ python af3_prep.py -i my_wide.csv -o out -s 1-10
 
 ---
 
-## 8) Example output (snippet)
+## 7) Example output (snippet)
 
 ```json
 {
@@ -199,7 +199,7 @@ python af3_prep.py -i my_wide.csv -o out -s 1-10
 
 ---
 
-## 9) Troubleshooting
+## 8) Troubleshooting
 
 * **Empty sequence / UniProt fetch failed**: check the accession and your network.
 * **PTM residue mismatch**: e.g., `SEP@560` but residue at 560 isn’t `S`. Verify positions and mutations.
@@ -208,7 +208,7 @@ python af3_prep.py -i my_wide.csv -o out -s 1-10
 
 ---
 
-## 10) Tips
+## 9) Tips
 
 * Prefer **long format** for flexibility and QC.
 * Use `muts` for **sequence edits**; `ptms` for **chemical modifications**.
