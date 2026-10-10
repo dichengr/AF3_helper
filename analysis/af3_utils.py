@@ -163,7 +163,7 @@ def plot_by_dataset(df: pd.DataFrame, value_col: str, title: str, ylabel: str,
     fig, ax = plt.subplots(figsize=(10, 6))
 
     if plot_type == 'box':
-        ax.boxplot(data_to_plot, labels=ordered, showfliers=False)
+        ax.boxplot(data_to_plot, showfliers=False)
     elif plot_type == 'violin':
         ax.violinplot(dataset=data_to_plot, showmedians=True)
     elif plot_type == 'dots':
