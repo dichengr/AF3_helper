@@ -15,11 +15,16 @@ from af3_utils import (
     plot_by_dataset
 )
 
+DEFAULT_IPSAE_PY = os.path.normpath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "third_party", "ipsae.py")
+)
+
 def parse_args():
     p = argparse.ArgumentParser(description="Collect and analyze AF3 metrics across multiple simulation runs.")
     p.add_argument("--base_dir", required=True, help="Root folder containing simulation subfolders.")
     p.add_argument("--out_dir", required=True, help="Directory to save output CSVs and plots.")
-    p.add_argument("--ipsae_py", default=r'E:\University\RA\Af3_helper\ipsae.py', help="Path to ipsae.py to enable advanced metric calculation.")
+    p.add_argument("--ipsae_py", default=DEFAULT_IPSAE_PY,
+                   help="Path to ipsae.py (default: the bundled third_party/ipsae.py). Pass '' to skip ipSAE scoring.")
     p.add_argument("--ipsae_pae", type=int, default=10, help="ipSAE PAE cutoff (default: 10).")
     p.add_argument("--ipsae_dist", type=int, default=10, help="ipSAE distance cutoff (default: 10).")
     p.add_argument("--plot", choices=["dots", "box", "violin"], default="dots", help="Plot style for metrics (default: dots).")
@@ -29,6 +34,10 @@ def main():
     args = parse_args()
     base_dir = os.path.abspath(args.base_dir)
     out_dir = os.path.abspath(args.out_dir)
+    # ipsae.py is launched with each run folder as cwd, so the path must be absolute
+    ipsae_py = os.path.abspath(args.ipsae_py) if args.ipsae_py else ""
+    if ipsae_py and not os.path.isfile(ipsae_py):
+        raise SystemExit(f"[!] ipsae.py not found at: {ipsae_py}")
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"[1/4] Scanning for runs and input files under: {base_dir}")
@@ -53,11 +62,11 @@ def main():
         plot_type=args.plot, out_png=os.path.join(out_dir, f"{args.plot}_iface_minPAE_by_dataset.png")
     )
 
-    if args.ipsae_py:
+    if ipsae_py:
         print(f"[3/4] Running `ipsae.py` on {len(df_iface)} runs...")
         chain_df, res_df = collect_ipsae_for_runs(
             df_runs=df_iface,
-            ipsae_py=args.ipsae_py,
+            ipsae_py=ipsae_py,
             pae_cutoff=args.ipsae_pae,
             dist_cutoff=args.ipsae_dist
         )
