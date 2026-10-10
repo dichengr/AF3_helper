@@ -363,9 +363,9 @@ def format_complex_name(
         for part, tags in zip(base_parts, mutation_tags):
             if tags:
                 if len(tags) <= 3:
-                    with_mut.append(f"{part}[mut_{','.join(tags)}]")
+                    with_mut.append(f"{part}[_{','.join(tags)}]")
                 else:
-                    with_mut.append(f"{part}[mut]")
+                    with_mut.append(f"{part}[_muts]")
             else:
                 with_mut.append(part)
         base_parts = with_mut
