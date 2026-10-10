@@ -1,19 +1,5 @@
 """
-af3_one_shot.py
-
-One-shot pipeline:
-    Input  : a BASE inference-output folder that contains multiple simulation subfolders
-    Output : (1) all_runs_summary.csv (raw per-run metrics)
-             (2) all_interface_metrics.csv (with iface_pTM_max & iface_minPAE)
-             (3) boxplots comparing datasets on iptm and iface_minPAE
-
-Usage:
-    python af3_one_shot.py --base_dir /path/to/inference_output --out_dir  /path/to/save_results   --iptm_thresh 0.7
-
-Notes:
-  * We skip any summary_confidences.json that are not inside a folder named
-    'seed-*_sample-*' to avoid collecting top-level "best" summaries without seed/sample.
-  * Boxplots are saved into out_dir as PNGs.
+One-shot analysis pipeline for AlphaFold3 inference outputs.
 """
 
 from __future__ import annotations
@@ -25,86 +11,84 @@ import pandas as pd
 from af3_utils import (
     collect_all_runs,
     add_interface_metrics,
-    plot_box_by_dataset,
-    plot_violin_by_dataset,
-    plot_dots_by_dataset,
-    summarize_by_dataset,
+    collect_ipsae_for_runs,
+    plot_by_dataset
 )
 
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Collect AF3 metrics across many simulations and plot comparisons.")
+    p = argparse.ArgumentParser(description="Collect and analyze AF3 metrics across multiple simulation runs.")
     p.add_argument("--base_dir", required=True, help="Root folder containing simulation subfolders.")
-    p.add_argument("--out_dir", default=None, help="Where to write CSVs/plots (default: BASE_DIR).")
-    p.add_argument("--iptm_thresh", type=float, default=0, help="Threshold for robust-run fraction summary (default: 0.7).")
-    # NEW plot style switch (default: dots for early-stage)
-    p.add_argument("--plot", choices=["dots","box","violin"], default="dots",
-                   help="Style for per-dataset plots of key metrics (default: dots).")
-    
+    p.add_argument("--out_dir", required=True, help="Directory to save output CSVs and plots.")
+    p.add_argument("--ipsae_py", default=r'E:\University\RA\Af3_helper\ipsae.py', help="Path to ipsae.py to enable advanced metric calculation.")
+    p.add_argument("--ipsae_pae", type=int, default=10, help="ipSAE PAE cutoff (default: 10).")
+    p.add_argument("--ipsae_dist", type=int, default=10, help="ipSAE distance cutoff (default: 10).")
+    p.add_argument("--plot", choices=["dots", "box", "violin"], default="dots", help="Plot style for metrics (default: dots).")
     return p.parse_args()
-
 
 def main():
     args = parse_args()
     base_dir = os.path.abspath(args.base_dir)
-    out_dir  = os.path.abspath(args.out_dir or base_dir)
+    out_dir = os.path.abspath(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"[+] Scanning under: {base_dir}")
-    df_raw = collect_all_runs(base_dir, verbose=True)
+    print(f"[1/4] Scanning for runs and input files under: {base_dir}")
+    df_raw = collect_all_runs(base_dir)
     if df_raw.empty:
-        raise SystemExit("No runs found (no '*summary_confidences.json' under seed-*_sample-* folders).")
+        raise SystemExit("[!] No valid runs found. Ensure folders are named '...seed-X_sample-Y...'.")
+    print(f"    Found {len(df_raw)} runs across {df_raw['dataset'].nunique()} datasets.")
 
-    raw_csv = os.path.join(out_dir, "all_runs_summary.csv")
-    df_raw.to_csv(raw_csv, index=False)
-    print(f"[+] Wrote raw runs CSV: {raw_csv}  (n={len(df_raw)})")
-
-    print("[+] Computing interface metrics...")
+    print("[2/4] Computing interface metrics (iface_pTM_max, iface_minPAE)...")
     df_iface = add_interface_metrics(df_raw)
     iface_csv = os.path.join(out_dir, "all_interface_metrics.csv")
     df_iface.to_csv(iface_csv, index=False)
-    print(f"[+] Wrote runs+iface CSV: {iface_csv}")
+    print(f"    -> Saved main results to: {iface_csv}")
 
-    # Summaries per dataset
-    df_sum = summarize_by_dataset(df_iface, iptm_threshold=args.iptm_thresh)
-    sum_csv = os.path.join(out_dir, "dataset_summaries.csv")
-    df_sum.to_csv(sum_csv, index=False)
-    print(f"[+] Wrote dataset summaries: {sum_csv}")
+    # Plot standard metrics
+    plot_by_dataset(
+        df_iface, "iptm", "iPTM by Dataset", "iPTM Score",
+        plot_type=args.plot, out_png=os.path.join(out_dir, f"{args.plot}_iptm_by_dataset.png")
+    )
+    plot_by_dataset(
+        df_iface, "iface_minPAE", "Interface min PAE by Dataset", "min PAE (Å)",
+        plot_type=args.plot, out_png=os.path.join(out_dir, f"{args.plot}_iface_minPAE_by_dataset.png")
+    )
 
+    if args.ipsae_py:
+        print(f"[3/4] Running `ipsae.py` on {len(df_iface)} runs...")
+        chain_df, res_df = collect_ipsae_for_runs(
+            df_runs=df_iface,
+            ipsae_py=args.ipsae_py,
+            pae_cutoff=args.ipsae_pae,
+            dist_cutoff=args.ipsae_dist
+        )
+        if not chain_df.empty:
+            ipsae_chain_csv = os.path.join(out_dir, "ipsae_chainpair_scores.csv")
+            chain_df.to_csv(ipsae_chain_csv, index=False)
+            print(f"    -> Saved ipSAE chain-pair scores to: {ipsae_chain_csv}")
 
-    # If you still want the legacy plots, you can conditionally call:
-    if args.plot == "dots":
-        # iPTM dots
-        iptm_png = os.path.join(out_dir, "dots_iptm_by_dataset.png")
-        plot_dots_by_dataset(df_iface, value_col="iptm",
-                             title="iPTM by dataset", ylabel="iPTM",
-                             out_png=iptm_png)
-        print(f"[+] Saved: {iptm_png}")
+            if not res_df.empty:
+                ipsae_res_csv = os.path.join(out_dir, "ipsae_residue_scores.csv")
+                res_df.to_csv(ipsae_res_csv, index=False)
+                print(f"    -> Saved ipSAE residue scores to: {ipsae_res_csv}")
 
-        pae_png = os.path.join(out_dir, "dots_iface_minPAE_by_dataset.png")
-        plot_dots_by_dataset(df_iface, value_col="iface_minPAE", title="Interface min PAE by dataset", ylabel="iface_minPAE (Å)", out_png=pae_png)
-        print(f"[+] Saved: {pae_png}")
-        
-    elif args.plot == "box":
-        iptm_png = os.path.join(out_dir, "box_iptm_by_dataset.png")
-        plot_box_by_dataset(df_iface, value_col="iptm", title="iPTM by dataset", ylabel="iPTM", out_png=iptm_png)
-        print(f"[+] Saved: {iptm_png}")
+            print("[4/4] Generating plots for advanced metrics...")
+            plot_df = chain_df.loc[chain_df["Type"].str.lower() == "max"].copy() if "Type" in chain_df.columns else chain_df.copy()
+            metrics_to_plot = {"ipSAE": "ipSAE Score", "pDockQ": "pDockQ Score", "pDockQ2": "pDockQ2 Score", "LIS": "LIS Score"}
 
-        pae_png = os.path.join(out_dir, "box_iface_minPAE_by_dataset.png")
-        plot_box_by_dataset(df_iface, value_col="iface_minPAE", title="Interface min PAE by dataset", ylabel="iface_minPAE (Å)", out_png=pae_png)
-        print(f"[+] Saved: {pae_png}")
+            for col, label in metrics_to_plot.items():
+                if col in plot_df.columns:
+                    plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+                    plot_by_dataset(
+                        plot_df, col, f"{col} (Type=max) by Dataset", label,
+                        plot_type=args.plot, out_png=os.path.join(out_dir, f"{args.plot}_{col}_by_dataset.png")
+                    )
+        else:
+            print("    -> No results generated from `ipsae.py`.")
+    else:
+        print("[3/4] Skipping `ipsae.py` run (path not provided).")
+        print("[4/4] Skipping advanced metric plotting.")
 
-    elif args.plot == "violin":
-        iptm_png = os.path.join(out_dir, "violin_iptm_by_dataset.png")
-        plot_violin_by_dataset(df_iface, value_col="iptm", title="iPTM by dataset", ylabel="iPTM", out_png=iptm_png)
-        print(f"[+] Saved: {iptm_png}")
-
-        pae_png = os.path.join(out_dir, "violin_iface_minPAE_by_dataset.png")
-        plot_violin_by_dataset(df_iface, value_col="iface_minPAE", title="Interface min PAE by dataset", ylabel="iface_minPAE (Å)", out_png=pae_png)
-        print(f"[+] Saved: {pae_png}")
-
-    print("[✓] Done.")
-
+    print("\n[✓] Analysis complete.")
 
 if __name__ == "__main__":
     main()

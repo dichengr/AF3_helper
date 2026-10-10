@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-af3_utils.py  (updated)
+af3_utils.py (Updated)
 
-- Robustly infers seed/sample from EITHER the directory name (e.g., seed-1_sample-0)
-  OR the filename (e.g., clust1_seed-1_sample-0_summary_confidences.json).
-- Silently ignores top-level best summaries (without seed/sample) to avoid noise.
-- Works on Windows and POSIX paths.
+Utilities for collecting, processing, and plotting AlphaFold3 results.
+- Integrates file finding (PAE JSON, CIF) into the initial run collection.
+- Uses flexible file patterns inspired by ipsae.py for robustness.
 """
 
 from __future__ import annotations
@@ -15,352 +14,222 @@ import os
 import re
 import json
 import fnmatch
-
-from typing import Dict, List, Tuple, Any, Iterable, Optional
+import subprocess
+from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import pandas as pd
 
-
-# --------------------------- Parsing helpers ---------------------------
+# --------------------------- Parsing & File Finding ---------------------------
 
 def _safe_load_json(path: str) -> dict:
-    with open(path, "r") as f:
-        return json.load(f)
-
-
-def parse_summary_file(json_path: str) -> Dict[str, Any]:
-    """
-    Parse one summary_confidences.json and return relevant fields.
-    Returns a dict with Python-native lists for JSON-serializable fields.
-    """
-    data = _safe_load_json(json_path)
-
-    return {
-        "iptm": data.get("iptm", None),
-        "ptm": data.get("ptm", None),
-        "ranking_score": data.get("ranking_score", None),
-        "fraction_disordered": data.get("fraction_disordered", None),
-        "has_clash": data.get("has_clash", None),
-        "chain_iptm": data.get("chain_iptm", []),
-        "chain_pair_iptm": data.get("chain_pair_iptm", []),
-        "chain_pair_pae_min": data.get("chain_pair_pae_min", []),
-    }
-
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        print(f"[-] Warning: Could not read or parse JSON {path}: {e}")
+        return {}
 
 _seed_sample_regex = re.compile(r"seed[-_](\d+).*sample[-_](\d+)", re.IGNORECASE)
 
-
-def infer_seed_and_sample_from_dir(dir_path: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Try to infer seed/sample from the directory name (e.g., 'seed-10_sample-0').
-    """
-    base = os.path.basename(dir_path)
-    m = _seed_sample_regex.search(base)
-    if m:
-        return m.group(1), m.group(2)
+def _infer_seed_and_sample(path: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
+    """Try to infer seed/sample from directory path first, then filename."""
+    dir_match = _seed_sample_regex.search(os.path.basename(path))
+    if dir_match:
+        return dir_match.group(1), dir_match.group(2)
+    file_match = _seed_sample_regex.search(filename)
+    if file_match:
+        return file_match.group(1), file_match.group(2)
     return None, None
-
-
-def infer_seed_and_sample_from_name(name: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Try to infer seed/sample from a filename (e.g., 'clust1_seed-10_sample-0_summary_confidences.json').
-    """
-    m = _seed_sample_regex.search(name)
-    if m:
-        return m.group(1), m.group(2)
-    return None, None
-
 
 def rel_dataset_label(base_dir: str, run_dir: str) -> str:
-    """
-    Infer the dataset/simulation label as the first path component under base_dir.
-    Example:
-        base_dir = /path/to/inference_output
-        run_dir  = /path/to/inference_output/SimulationA/seed-1_sample-0
-        -> label = "SimulationA"
-    """
+    """Infer the dataset label from the first path component under base_dir."""
     rel = os.path.relpath(run_dir, base_dir)
-    # First component before os.sep
-    top = rel.split(os.sep)[0]
-    return top
+    return rel.split(os.sep)[0]
 
+    # More flexible patterns inspired by ipsae.py
 
-# --------------------------- Collection ---------------------------
+_AF3_JSON_PATTERNS = ["*confidences.json"]
+_AF3_CIF_PATTERNS = ["*.cif"]
 
-def collect_all_runs(base_dir: str, verbose: bool = False) -> pd.DataFrame:
+def _find_first_match(directory: str, patterns: list[str], exclude: str = "") -> str | None:
+    """Find the first file in a directory matching a list of patterns."""
+    for pat in patterns:
+        for fn in sorted(fnmatch.filter(os.listdir(directory), pat)):
+            if exclude and exclude in fn:
+                continue
+            return os.path.join(directory, fn)
+    return None
+
+def find_ipsae_inputs(run_folder: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (pae_json_path, cif_path) for a run folder using flexible patterns."""
+    # For JSON, we must exclude 'summary_confidences.json'
+    json_path = _find_first_match(run_folder, _AF3_JSON_PATTERNS, exclude="summary")
+    cif_path = _find_first_match(run_folder, _AF3_CIF_PATTERNS)
+    return json_path, cif_path
+
+# --------------------------- Collection (Integrated) ---------------------------
+
+def collect_all_runs(base_dir: str) -> pd.DataFrame:
     """
-    Walk base_dir recursively, find '*_summary_confidences.json', parse the file,
-    and return a DataFrame with one row per (seed, sample) run.
-    We intentionally skip summary files that do not have seed/sample in either their parent
-    folder OR in the filename (to avoid top-level best summaries).
+    Walk base_dir, find valid runs, parse summaries, and find input files for ipSAE.
     """
     records: List[Dict[str, Any]] = []
-
     for root, _, files in os.walk(base_dir):
-        for fname in files:
-            # only look at summary files (avoid *_confidences.json)
-            if not (fname == "summary_confidences.json" or fname.endswith("_summary_confidences.json")):
-                continue
+        # Find summary files to identify valid runs
+        summary_files = [f for f in files if "summary_confidences.json" in f]
+        if not summary_files:
+            continue
 
-            json_path = os.path.join(root, fname)
-
-            # Try dir-based inference first, then fallback to filename
-            seed, sample = infer_seed_and_sample_from_dir(root)
-            
+        for fname in summary_files:
+            seed, sample = _infer_seed_and_sample(root, fname)
             if seed is None or sample is None:
-                seed, sample = infer_seed_and_sample_from_name(fname)
+                continue  # Skip top-level or non-run-specific summaries
 
-            if seed is None or sample is None:
-                # Silently skip (these are likely dataset-level "best" summaries)
-                if verbose:
-                    print(f"[skip] are likely dataset-level best summaries: {json_path}")
-                continue
-
-            parsed = parse_summary_file(json_path)
-            dataset = rel_dataset_label(base_dir, root)
+            # A valid run was found, now parse its data and find its input files
+            summary_path = os.path.join(root, fname)
+            parsed_summary = _safe_load_json(summary_path)
+            pae_json_path, cif_path = find_ipsae_inputs(root)
 
             records.append({
-                "dataset": dataset,
+                "dataset": rel_dataset_label(base_dir, root),
                 "seed": seed,
                 "sample": sample,
-                "iptm": parsed["iptm"],
-                "ptm": parsed["ptm"],
-                "ranking_score": parsed["ranking_score"],
-                "fraction_disordered": parsed["fraction_disordered"],
-                "has_clash": parsed["has_clash"],
-                # store JSON-encoded strings to keep CSV simple
-                "chain_iptm": json.dumps(parsed["chain_iptm"]),
-                "chain_pair_iptm": json.dumps(parsed["chain_pair_iptm"]),
-                "chain_pair_pae_min": json.dumps(parsed["chain_pair_pae_min"]),
-                "json_path": json_path,
+                "iptm": parsed_summary.get("iptm"),
+                "ptm": parsed_summary.get("ptm"),
+                "ranking_score": parsed_summary.get("ranking_score"),
+                "chain_pair_iptm": json.dumps(parsed_summary.get("chain_pair_iptm", [])),
+                "chain_pair_pae_min": json.dumps(parsed_summary.get("chain_pair_pae_min", [])),
                 "run_folder": root,
+                "summary_path": summary_path,
+                "cif_path": cif_path,
+                "pae_json_path": pae_json_path,
             })
 
     if not records:
-        return pd.DataFrame(columns=[
-            "dataset","seed","sample","iptm","ptm","ranking_score",
-            "fraction_disordered","has_clash",
-            "chain_iptm","chain_pair_iptm","chain_pair_pae_min",
-            "json_path","run_folder"
-        ])
+        return pd.DataFrame()
 
     df = pd.DataFrame.from_records(records)
     # Ensure stable column order
     cols = [
-        "dataset","seed","sample","iptm","ptm","ranking_score",
-        "fraction_disordered","has_clash",
-        "chain_iptm","chain_pair_iptm","chain_pair_pae_min",
-        "run_folder","json_path"
+        "dataset", "seed", "sample", "iptm", "ptm", "ranking_score",
+        "chain_pair_iptm", "chain_pair_pae_min", "run_folder", "cif_path",
+        "pae_json_path", "summary_path"
     ]
-    df = df[[c for c in cols if c in df.columns]]
-    return df
+    return df[cols]
 
-
-# --------------------------- Interface metrics ---------------------------
+# --------------------------- Interface & Plotting --------------------
 
 def _off_diagonal_values(mat: List[List[float]]) -> List[float]:
-    """
-    Return all off-diagonal entries from a square matrix 'mat'.
-    If 'mat' is malformed, return [] gracefully.
-    """
-    try:
-        n = len(mat)
-        vals = []
-        for i in range(n):
-            row = mat[i]
-            for j in range(n):
-                if i == j:
-                    continue
-                vals.append(row[j])
-        return vals
-    except Exception:
+    if not isinstance(mat, list) or not all(isinstance(row, list) for row in mat):
         return []
+    n = len(mat)
 
+    return [mat[i][j] for i in range(n) for j in range(n) if i != j]
 
 def compute_iface_metrics_for_row(row: pd.Series) -> pd.Series:
-    """
-    From chain_pair_iptm and chain_pair_pae_min (JSON strings), compute:
-        iface_pTM_max  = max off-diagonal chain-pair iptm
-        iface_minPAE   = min off-diagonal chain-pair min-PAE
-    Returns a Series with those two metrics.
-    """
     try:
         cp_iptm = json.loads(row["chain_pair_iptm"]) if pd.notna(row["chain_pair_iptm"]) else []
-        cp_pae  = json.loads(row["chain_pair_pae_min"]) if pd.notna(row["chain_pair_pae_min"]) else []
-    except Exception:
+        cp_pae = json.loads(row["chain_pair_pae_min"]) if pd.notna(row["chain_pair_pae_min"]) else []
+    except (json.JSONDecodeError, TypeError):
         cp_iptm, cp_pae = [], []
 
     ptm_vals = _off_diagonal_values(cp_iptm)
     pae_vals = _off_diagonal_values(cp_pae)
-
-    iface_pTM_max = float(np.nanmax(ptm_vals)) if len(ptm_vals) else np.nan
-    iface_minPAE  = float(np.nanmin(pae_vals)) if len(pae_vals) else np.nan
+    iface_pTM_max = float(np.nanmax(ptm_vals)) if ptm_vals else np.nan
+    iface_minPAE = float(np.nanmin(pae_vals)) if pae_vals else np.nan
 
     return pd.Series({"iface_pTM_max": iface_pTM_max, "iface_minPAE": iface_minPAE})
 
-
 def add_interface_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Append iface metrics to a DataFrame returned by collect_all_runs.
-    """
     if df.empty:
-        return df.copy()
-    iface = df.apply(compute_iface_metrics_for_row, axis=1)
-    out = pd.concat([df.reset_index(drop=True), iface], axis=1)
-    return out
-
-
-# --------------------------- Plotting ---------------------------
-
-
-
-def plot_violin_by_dataset(df: pd.DataFrame,
-                           value_col: str,
-                           title: str,
-                           ylabel: str,
-                           out_png: Optional[str] = None) -> None:
-    """
-    Matplotlib violin plot grouped by 'dataset' for the given value_col.
-    - One chart per figure.
-    - No explicit colors/styles set.
-    - Orders datasets by median (descending for iPTM-like, ascending for PAE-like).
-    - Shows medians inside violins.
-    """
-    import matplotlib.pyplot as plt
-
-    if df.empty or value_col not in df.columns:
-        raise ValueError(f"No data to plot for column '{value_col}'.")
-
-    ascending = True if "pae" in value_col.lower() else False
-    med = df.groupby("dataset")[value_col].median().sort_values(ascending=ascending)
-    ordered = med.index.tolist()
-
-    data_to_plot = [df.loc[df["dataset"] == ds, value_col].dropna().values for ds in ordered]
-    med_vals = [med.loc[ds] for ds in ordered]
-
-    fig = plt.figure(figsize=(10, 6))
-    ax = plt.gca()
-    parts = ax.violinplot(dataset=data_to_plot, showmeans=False, showmedians=True, showextrema=False)
-
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.set_xticks(range(1, len(ordered) + 1))
-    ax.set_xticklabels(ordered, rotation=30, ha="right")
-
-    # Annotate median numbers slightly above the median line
-    for i, m in enumerate(med_vals, start=1):
-        ax.annotate(f"{m:.3f}", xy=(i, m), xytext=(0, 4),
-                    textcoords="offset points", ha="center", va="bottom", fontsize=9)
+        return df
     
-    y_min, y_max = ax.get_ylim()
-    pad = (y_max - y_min) * 0.06 if y_max > y_min else 0.1
-    ax.set_ylim(y_min, y_max + pad)
+    iface_metrics = df.apply(compute_iface_metrics_for_row, axis=1)
 
-    plt.tight_layout()
+    return pd.concat([df.reset_index(drop=True), iface_metrics], axis=1)
 
-    if out_png:
-        fig.savefig(out_png, dpi=200, bbox_inches="tight")
-    plt.show()
-
-
-def plot_box_by_dataset(df: pd.DataFrame,
-                        value_col: str,
-                        title: str,
-                        ylabel: str,
-                        out_png: Optional[str] = None) -> None:
-    """
-    Use matplotlib to plot a simple boxplot grouped by 'dataset' for the given value_col.
-    NOTE: Per instruction, we use matplotlib only, one chart per figure, and do not set colors.
-    """
+def plot_by_dataset(df: pd.DataFrame, value_col: str, title: str, ylabel: str,
+                    plot_type: str = 'dots', out_png: Optional[str] = None) -> None:
     import matplotlib.pyplot as plt
 
-    if df.empty or value_col not in df.columns:
-        raise ValueError(f"No data to plot for column '{value_col}'.")
-
-    # Ensure categories sorted by median (descending for iPTM, ascending for PAE)
-    ascending = True if "pae" in value_col.lower() else False
+    if df.empty or value_col not in df.columns or df[value_col].isnull().all():
+        print(f"[-] Warning: No data to plot for column '{value_col}'. Skipping plot.")
+        return
+    ascending = "pae" in value_col.lower()
     med = df.groupby("dataset")[value_col].median().sort_values(ascending=ascending)
     ordered = med.index.tolist()
-
-    fig = plt.figure(figsize=(10, 6))
     data_to_plot = [df.loc[df["dataset"] == ds, value_col].dropna().values for ds in ordered]
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-    plt.boxplot(data_to_plot, labels=ordered, showfliers=False)
-    plt.title(title)
-    plt.ylabel(ylabel)
-    plt.xticks(rotation=30, ha="right")
-    plt.tight_layout()
-
-    if out_png:
-        fig.savefig(out_png, dpi=200, bbox_inches="tight")
-
-    # If running in an interactive notebook, show; in scripts this is harmless.
-    plt.show()
-
-
-def plot_dots_by_dataset(df: pd.DataFrame,
-                         value_col: str,
-                         title: str,
-                         ylabel: str,
-                         out_png: Optional[str] = None,
-                         jitter: float = 0.15,
-                         s: float = 16.0) -> None:
-    """
-    Jittered dot plot of value_col grouped by 'dataset' (no seaborn, one chart per figure).
-    """
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    if df.empty or value_col not in df.columns:
-        raise ValueError(f"No data to plot for column '{value_col}'.")
-
-    ordered = sorted(df["dataset"].unique().tolist())
-    x_pos = {ds: i for i, ds in enumerate(ordered, start=1)}
-
-    fig = plt.figure(figsize=(10, 6))
-    ax = plt.gca()
-
-    for ds in ordered:
-        vals = df.loc[df["dataset"] == ds, value_col].astype(float)
-        x = np.full(len(vals), x_pos[ds], dtype=float) + (np.random.rand(len(vals)) - 0.5) * 2 * jitter
-        ax.scatter(x, vals, s=s, alpha=0.8)
+    if plot_type == 'box':
+        ax.boxplot(data_to_plot, labels=ordered, showfliers=False)
+    elif plot_type == 'violin':
+        ax.violinplot(dataset=data_to_plot, showmedians=True)
+    elif plot_type == 'dots':
+        for i, ds_data in enumerate(data_to_plot, start=1):
+            x = np.random.normal(i, 0.08, size=len(ds_data))
+            ax.scatter(x, ds_data, s=16, alpha=0.6)
 
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xticks(range(1, len(ordered) + 1))
     ax.set_xticklabels(ordered, rotation=30, ha="right")
     plt.tight_layout()
+    
     if out_png:
         fig.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.show()
+    plt.close(fig)
 
+# --------------------------- ipSAE Integration (Simplified) --------------------
 
-# --------------------------- Summaries ---------------------------
+def run_ipsae_on_run(run_folder: str, pae_json_path: str, cif_path: str, ipsae_py: str,
+                       pae_cutoff: int, dist_cutoff: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Execute ipsae.py on a single run using pre-found file paths."""
+    if not pae_json_path or not cif_path:
+        print(f"[-] Warning: Missing PAE JSON or CIF path for {run_folder}. Skipping IPSAE.")
+        return pd.DataFrame(), pd.DataFrame()
 
-def summarize_by_dataset(df: pd.DataFrame,
-                         iptm_threshold: float = 0.7) -> pd.DataFrame:
-    """
-    Return a compact summary per dataset: n_runs, iptm median/IQR, fraction above threshold,
-    iface_pTM_max median/IQR, iface_minPAE median/IQR.
-    """
-    if df.empty:
-        return pd.DataFrame()
+    cif_stem = os.path.basename(cif_path).replace(".cif", "")
+    pae_str, dist_str = f"{pae_cutoff:02d}", f"{dist_cutoff:02d}"
+    base_name = f"{cif_stem}_{pae_str}_{dist_str}"
+    chain_output_path = os.path.join(run_folder, f"{base_name}.txt")
+    res_output_path = os.path.join(run_folder, f"{base_name}_byres.txt")
 
-    def iqr(x: Iterable[float]) -> float:
-        q75, q25 = np.nanpercentile(x, 75), np.nanpercentile(x, 25)
-        return float(q75 - q25)
+    cmd = ["python", ipsae_py, pae_json_path, cif_path, str(pae_cutoff), str(dist_cutoff)]
+    proc = subprocess.run(cmd, cwd=run_folder, capture_output=True, text=True, check=False)
 
-    g = df.groupby("dataset")
-    summary = pd.DataFrame({
-        "n_runs": g.size(),
-        "iptm_median": g["iptm"].median(),
-        "iptm_iqr": g["iptm"].apply(iqr),
-        "iptm_frac_ge_thresh": g["iptm"].apply(lambda s: float(np.mean(s >= iptm_threshold))),
-        "iface_pTM_max_median": g["iface_pTM_max"].median(),
-        "iface_pTM_max_iqr": g["iface_pTM_max"].apply(iqr),
-        "iface_minPAE_median": g["iface_minPAE"].median(),
-        "iface_minPAE_iqr": g["iface_minPAE"].apply(iqr),
-    }).reset_index()
+    if proc.returncode != 0:
+        print(f"[!] Error running IPSAE on {run_folder}:\n{proc.stderr}")
+        return pd.DataFrame(), pd.DataFrame()
 
-    return summary
+    df_chain = pd.read_csv(chain_output_path, sep=r"\s+", on_bad_lines='skip').dropna(how='all') if os.path.exists(chain_output_path) else pd.DataFrame()
+    df_res = pd.read_csv(res_output_path, sep=r"\s+", on_bad_lines='skip').dropna(how='all') if os.path.exists(res_output_path) else pd.DataFrame()
+    return df_chain, df_res
+
+def collect_ipsae_for_runs(df_runs: pd.DataFrame, ipsae_py: str, pae_cutoff: int,
+                           dist_cutoff: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """For each run in the DataFrame, run IPSAE and concatenate the results."""
+    if df_runs.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    all_chains, all_res = [], []
+    for _, row in df_runs.iterrows():
+        cdf, rdf = run_ipsae_on_run(
+            run_folder=row["run_folder"],
+            pae_json_path=row["pae_json_path"],
+            cif_path=row["cif_path"],
+            ipsae_py=ipsae_py,
+            pae_cutoff=pae_cutoff,
+            dist_cutoff=dist_cutoff
+        )
+        if not cdf.empty:
+            for col in ["dataset", "seed", "sample"]: cdf[col] = row[col]
+            all_chains.append(cdf)
+        if not rdf.empty:
+            for col in ["dataset", "seed", "sample"]: rdf[col] = row[col]
+            all_res.append(rdf)
+
+    return pd.concat(all_chains, ignore_index=True) if all_chains else pd.DataFrame(), \
+           pd.concat(all_res, ignore_index=True) if all_res else pd.DataFrame()
